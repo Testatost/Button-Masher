@@ -2,57 +2,79 @@ import sys
 import time
 import math
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
-from pynput import mouse
+from typing import Optional, List, Tuple
 
+from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtGui import QPainter, QPen, QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton,
-    QHBoxLayout, QSpinBox, QCheckBox, QComboBox, QSizePolicy, QMessageBox,
-    QTabWidget, QInputDialog
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QSpinBox, QCheckBox, QComboBox, QTabWidget, QMessageBox,
+    QInputDialog, QSlider, QFileDialog, QFrame, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPainter, QPen, QColor
 
-from pynput import keyboard
+from pynput import keyboard as pynput_keyboard
 from pynput.keyboard import Controller as KeyController, Key
 from pynput.mouse import Controller as MouseController, Button
 
-# -------------------------------------------------------
-# GLOBAL CONTROLLERS
-# -------------------------------------------------------
-
+# -------------------------------
+# Global controllers (Simulation)
+# -------------------------------
 kb = KeyController()
-mouse = MouseController()
+ms = MouseController()
 
-# Speicherpfad für Profile
 SETTINGS_PATH = Path(__file__).with_name("button_masher_profiles.json")
 
+# -------------------------------
+# Helpers
+# -------------------------------
+def clamp_int(val, lo, hi, default):
+    try:
+        v = int(val)
+    except Exception:
+        return default
+    return max(lo, min(hi, v))
 
-# ---------------------------------------------------------
-#               SHAPE GENERATORS
-# ---------------------------------------------------------
+SPECIAL_KEYS = {
+    "enter": Key.enter, "space": Key.space, "tab": Key.tab,
+    "shift": Key.shift, "ctrl": Key.ctrl, "alt": Key.alt,
+    "esc": Key.esc, "up": Key.up, "down": Key.down,
+    "left": Key.left, "right": Key.right,
+    **{f"f{i}": getattr(Key, f"f{i}") for i in range(1, 13)}
+}
 
+def press_key_text(key_text: str):
+    k = (key_text or "").strip().lower()
+    if not k:
+        return
+    if k in SPECIAL_KEYS:
+        kb.press(SPECIAL_KEYS[k])
+        kb.release(SPECIAL_KEYS[k])
+        return
+    if len(k) == 1:
+        kb.press(k)
+        kb.release(k)
+
+def safe_float_pair_list(obj) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    if not isinstance(obj, list):
+        return out
+    for it in obj:
+        try:
+            x, y = it
+            out.append((float(x), float(y)))
+        except Exception:
+            pass
+    return out
+
+# -------------------------------
+# Shapes
+# -------------------------------
 def generate_circle_points(radius=150, steps=240):
-    pts = []
-    for i in range(steps):
-        a = 2 * math.pi * i / steps
-        pts.append((math.cos(a) * radius, math.sin(a) * radius))
-    return pts
-
-
-def generate_triangle_points(size=200, steps=180):
-    pts = []
-    corners = [(0, -size), (size, size), (-size, size), (0, -size)]
-    seg = steps // 3
-    for i in range(3):
-        x1, y1 = corners[i]
-        x2, y2 = corners[i + 1]
-        for s in range(seg):
-            t = s / seg
-            pts.append((x1 + (x2 - x1) * t), (y1 + (y2 - y1) * t))
-    return pts
-
+    return [(math.cos(2*math.pi*i/steps)*radius,
+             math.sin(2*math.pi*i/steps)*radius) for i in range(steps)]
 
 def generate_square_points(size=200, steps=200):
     pts = []
@@ -61,10 +83,10 @@ def generate_square_points(size=200, steps=200):
     seg = steps // 4
     for i in range(4):
         x1, y1 = corners[i]
-        x2, y2 = corners[i + 1]
+        x2, y2 = corners[i+1]
         for s in range(seg):
             t = s / seg
-            pts.append((x1 + (x2 - x1) * t), (y1 + (y2 - y1) * t))
+            pts.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
     return pts
 
 def generate_eight_points(radius=150, steps=300):
@@ -76,24 +98,122 @@ def generate_eight_points(radius=150, steps=300):
         pts.append((x, y))
     return pts
 
+def generate_horizontal_eight_points(radius=150, steps=300):
+    pts = []
+    for i in range(steps):
+        t = 2 * math.pi * i / steps
+        x = radius * math.sin(t)
+        y = radius * math.sin(t) * math.cos(t) * 1.6
+        pts.append((x, y))
+    return pts
 
-# ---------------------------------------------------------
-#                DRAWING WIDGET
-# ---------------------------------------------------------
+# -------------------------------
+# Window resize controller
+# -------------------------------
+class WindowResizeController:
+    def __init__(self, window: QWidget, base_size: QSize):
+        self.window = window
+        self.base_size = QSize(base_size)
+        self.timer = QTimer()
+        self.timer.setInterval(30)
+        self.timer.timeout.connect(self._step)
 
-class DrawingWidget(QWidget):
-    def __init__(self, profile_widget):
+    def nudge(self):
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def _step(self):
+        cur = self.window.size()
+        dx = self.base_size.width() - cur.width()
+        dy = self.base_size.height() - cur.height()
+
+        if abs(dx) < 2 and abs(dy) < 2:
+            self.window.resize(self.base_size)
+            self.timer.stop()
+            return
+
+        self.window.resize(
+            cur.width() + int(dx * 0.15),
+            cur.height() + int(dy * 0.15)
+        )
+
+# -------------------------------
+# Click positions
+# -------------------------------
+@dataclass
+class ClickPosition:
+    enabled: bool
+    x: int
+    y: int
+    interval_ms: int  # 0 => fallback
+
+    def to_dict(self):
+        return {
+            "enabled": bool(self.enabled),
+            "x": int(self.x),
+            "y": int(self.y),
+            "interval_ms": int(self.interval_ms),
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "ClickPosition":
+        return ClickPosition(
+            enabled=bool(d.get("enabled", True)),
+            x=clamp_int(d.get("x"), -10_000_000, 10_000_000, 0),
+            y=clamp_int(d.get("y"), -10_000_000, 10_000_000, 0),
+            interval_ms=clamp_int(d.get("interval_ms"), 0, 60000, 0),
+        )
+
+class ClickPositionRow(QWidget):
+    def __init__(self, pos: ClickPosition, on_remove):
         super().__init__()
-        self.profile_widget = profile_widget
+        self.pos = pos
+        self.on_remove = on_remove
 
-        # DYNAMISCHE GRÖSSE!
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
+        self.cb_enabled = QCheckBox()
+        self.cb_enabled.setChecked(pos.enabled)
+        layout.addWidget(self.cb_enabled)
+
+        self.lbl_xy = QLabel(f"x={pos.x}, y={pos.y}")
+        self.lbl_xy.setMinimumWidth(160)
+        layout.addWidget(self.lbl_xy)
+
+        layout.addWidget(QLabel("Intervall (ms):"))
+        self.sp_interval = QSpinBox()
+        self.sp_interval.setRange(0, 60000)
+        self.sp_interval.setValue(pos.interval_ms)
+        self.sp_interval.setFixedWidth(110)
+        layout.addWidget(self.sp_interval)
+
+        btn_del = QPushButton("✕")
+        btn_del.setFixedWidth(28)
+        layout.addWidget(btn_del)
+
+        self.cb_enabled.stateChanged.connect(self._sync)
+        self.sp_interval.valueChanged.connect(self._sync)
+        btn_del.clicked.connect(lambda: self.on_remove(self))
+
+    def _sync(self):
+        self.pos.enabled = self.cb_enabled.isChecked()
+        self.pos.interval_ms = self.sp_interval.value()
+
+# -------------------------------
+# Drawing widget (250x250)
+# -------------------------------
+class DrawingWidget(QWidget):
+    def __init__(self, target_points_list: List[Tuple[float, float]]):
+        super().__init__()
+        self.target_points_list = target_points_list
         self.path = []
         self.drawing = False
+        self.setFixedSize(250, 250)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
     def sizeHint(self):
-        return QSize(300, 300)
+        return QSize(250, 250)
 
     def mousePressEvent(self, event):
         self.drawing = True
@@ -107,19 +227,18 @@ class DrawingWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self.drawing = False
         if len(self.path) > 1:
-            pts = self.normalize_points(self.path)
-            self.profile_widget.custom_path_points = pts
+            self.target_points_list.clear()
+            self.target_points_list.extend(self._normalize_points(self.path))
 
     def paintEvent(self, event):
         qp = QPainter(self)
         qp.fillRect(self.rect(), QColor(230, 230, 230))
-        pen = QPen(QColor(0, 0, 0), 2)
-        qp.setPen(pen)
+        qp.setPen(QPen(QColor(0, 0, 0), 2))
         if len(self.path) >= 2:
             for i in range(len(self.path) - 1):
                 qp.drawLine(self.path[i], self.path[i + 1])
 
-    def normalize_points(self, pts):
+    def _normalize_points(self, pts):
         xs = [p.x() for p in pts]
         ys = [p.y() for p in pts]
         cx = (max(xs) + min(xs)) / 2
@@ -127,6 +246,7 @@ class DrawingWidget(QWidget):
         scale = max(max(xs) - min(xs), max(ys) - min(ys))
         if scale <= 0:
             scale = 1
+
         normalized = []
         for p in pts:
             x = (p.x() - cx) / scale * 200
@@ -134,789 +254,763 @@ class DrawingWidget(QWidget):
             normalized.append((x, y))
         return normalized
 
-
-# ---------------------------------------------------------
-#             EINZELNES PROFIL (TAB-INHALT)
-# ---------------------------------------------------------
-
-class ProfileWidget(QWidget):
-    def __init__(self, main_window, initial_name="Profil 1"):
+# -------------------------------
+# Set widget
+# -------------------------------
+class SetWidget(QWidget):
+    def __init__(self, set_index: int, on_ui_changed):
         super().__init__()
+        self.set_index = set_index
+        self.on_ui_changed = on_ui_changed
 
-        self.main_window = main_window
-        self.profile_name = initial_name
+        self.positions: List[ClickPosition] = []
+        self.position_rows: List[ClickPositionRow] = []
+        self.custom_path_points: List[Tuple[float, float]] = []
 
-        self.running = False
-        self.run_id = 0
-        self.current_run_id = None
+        self._build_ui()
 
-        self.custom_path_points = []
-        self.mouse_enabled = False
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
 
-        self.custom_hotkeys_enabled = False
-        self.start_hotkey = ""
-        self.stop_hotkey = ""
+        # Keys
+        layout.addWidget(QLabel(f"Set {self.set_index} – Tasten (kommagetrennt):"))
+        self.keys_input = QLineEdit()
+        layout.addWidget(self.keys_input)
 
-        self.movement_thread = None
-        self.click_thread = None
-        self.key_thread = None
-        self.alternate_thread = None
+        row_t = QHBoxLayout()
+        row_t.addWidget(QLabel("Abstand zw. Tasten (ms):"))
+        self.inner_ms = QSpinBox()
+        self.inner_ms.setRange(1, 60000)
+        self.inner_ms.setValue(50)
+        row_t.addWidget(self.inner_ms)
 
-        self.build_ui()
+        row_t.addWidget(QLabel("Wiederholung nach (ms):"))
+        self.repeat_ms = QSpinBox()
+        self.repeat_ms.setRange(1, 60000)
+        self.repeat_ms.setValue(150)
+        row_t.addWidget(self.repeat_ms)
+        layout.addLayout(row_t)
 
-
-    # -----------------------------------------------------
-    # GUI Aufbau
-    # -----------------------------------------------------
-
-    def build_ui(self):
-        layout = QVBoxLayout()
-
-        # Set 1
-        layout.addWidget(QLabel("Tasten (Set 1):"))
-        self.key_input1 = QLineEdit()
-        layout.addWidget(self.key_input1)
-
-        h1 = QHBoxLayout()
-        h1.addWidget(QLabel("Intervall Set 1 (ms):"))
-        self.interval1 = QSpinBox()
-        self.interval1.setRange(10, 60000)
-        self.interval1.setValue(150)
-        h1.addWidget(self.interval1)
-        layout.addLayout(h1)
-
-        h1b = QHBoxLayout()
-        h1b.addWidget(QLabel("Intervall zw. Tasten (ms):"))
-        self.inner1 = QSpinBox()
-        self.inner1.setRange(1, 60000)
-        self.inner1.setValue(50)
-        h1b.addWidget(self.inner1)
-        layout.addLayout(h1b)
-
-        # Set 2
-        self.cb_set2 = QCheckBox("Set 2 aktivieren")
-        self.cb_set2.stateChanged.connect(self.toggle_set2)
-        layout.addWidget(self.cb_set2)
-
-        layout.addWidget(QLabel("Tasten (Set 2):"))
-        self.key_input2 = QLineEdit()
-        self.key_input2.setEnabled(False)
-        layout.addWidget(self.key_input2)
-
-        h2 = QHBoxLayout()
-        h2.addWidget(QLabel("Intervall Set 2 (ms):"))
-        self.interval2 = QSpinBox()
-        self.interval2.setRange(10, 60000)
-        self.interval2.setValue(300)
-        self.interval2.setEnabled(False)
-        h2.addWidget(self.interval2)
-        layout.addLayout(h2)
-
-        h2b = QHBoxLayout()
-        h2b.addWidget(QLabel("Intervall zw. Tasten Set 2 (ms):"))
-        self.inner2 = QSpinBox()
-        self.inner2.setRange(1, 60000)
-        self.inner2.setValue(50)
-        self.inner2.setEnabled(False)
-        h2b.addWidget(self.inner2)
-        layout.addLayout(h2b)
-
-        # Switch
-        self.cb_switch = QCheckBox("Zwischen Set 1 & 2 wechseln")
-        self.cb_switch.stateChanged.connect(self.toggle_switch)
+        # Switch after time
+        self.cb_switch = QCheckBox("Wechsel zum nächsten Set nach Zeit")
         layout.addWidget(self.cb_switch)
 
-        hsw = QHBoxLayout()
-        hsw.addWidget(QLabel("Wechselzeit:"))
+        row_sw = QHBoxLayout()
+        row_sw.addWidget(QLabel("nach"))
         self.sw_min = QSpinBox()
         self.sw_min.setRange(0, 180)
-        self.sw_min.setEnabled(False)
-        hsw.addWidget(self.sw_min)
-        hsw.addWidget(QLabel("min"))
-
+        row_sw.addWidget(self.sw_min)
+        row_sw.addWidget(QLabel("min"))
         self.sw_sec = QSpinBox()
         self.sw_sec.setRange(0, 59)
-        self.sw_sec.setEnabled(False)
-        hsw.addWidget(self.sw_sec)
-        hsw.addWidget(QLabel("sek"))
-        layout.addLayout(hsw)
+        row_sw.addWidget(self.sw_sec)
+        row_sw.addWidget(QLabel("sek → Set"))
+        self.sw_target = QSpinBox()
+        self.sw_target.setRange(1, 999)
+        self.sw_target.setValue(1)
+        row_sw.addWidget(self.sw_target)
+        layout.addLayout(row_sw)
 
-        self.cb_immediate = QCheckBox("Nach Set 2 sofort zurück")
-        self.cb_immediate.setEnabled(False)
-        layout.addWidget(self.cb_immediate)
+        # Jump back after cycle
+        row_back = QHBoxLayout()
+        self.cb_jump_back = QCheckBox("Nach Set-Durchlauf zurück zu Set:")
+        row_back.addWidget(self.cb_jump_back)
+        self.jump_back_target = QSpinBox()
+        self.jump_back_target.setRange(1, 999)
+        self.jump_back_target.setValue(1)
+        row_back.addWidget(self.jump_back_target)
+        layout.addLayout(row_back)
 
-        # Autoklicker
-        self.cb_mouse = QCheckBox("Linksklick aktivieren")
-        self.cb_mouse.stateChanged.connect(self.toggle_mouse)
-        layout.addWidget(self.cb_mouse)
+        self.cb_switch.stateChanged.connect(self._toggle_switch_fields)
+        self.cb_jump_back.stateChanged.connect(self._toggle_jump_fields)
+        self._toggle_switch_fields()
+        self._toggle_jump_fields()
 
-        hm = QHBoxLayout()
-        hm.addWidget(QLabel("Klick Intervall (ms):"))
-        self.mouse_interval = QSpinBox()
-        self.mouse_interval.setRange(10, 60000)
-        self.mouse_interval.setValue(200)
-        self.mouse_interval.setEnabled(False)
-        hm.addWidget(self.mouse_interval)
-        layout.addLayout(hm)
+        layout.addWidget(self._hline())
 
-        # Mausbewegung
+        # Click
+        self.cb_click = QCheckBox("Linksklick aktivieren")
+        layout.addWidget(self.cb_click)
+
+        row_c1 = QHBoxLayout()
+        self.cb_click_interval = QCheckBox("Intervall aktivieren")
+        row_c1.addWidget(self.cb_click_interval)
+
+        row_c1.addWidget(QLabel("Globales Fallback-Intervall (ms):"))
+        self.global_click_interval = QSpinBox()
+        self.global_click_interval.setRange(10, 60000)
+        self.global_click_interval.setValue(200)
+        self.global_click_interval.setEnabled(False)
+        row_c1.addWidget(self.global_click_interval)
+
+        self.cb_positions = QCheckBox("Bis zu 8 Positionen (F7 speichern)")
+        self.cb_positions.setEnabled(False)
+        row_c1.addWidget(self.cb_positions)
+
+        self.lbl_pos_count = QLabel("Positionen: 0/8")
+        row_c1.addWidget(self.lbl_pos_count)
+
+        self.btn_clear_positions = QPushButton("Positionen leeren")
+        self.btn_clear_positions.setEnabled(False)
+        self.btn_clear_positions.clicked.connect(self.clear_positions)
+        row_c1.addWidget(self.btn_clear_positions)
+
+        layout.addLayout(row_c1)
+
+        self.positions_container = QVBoxLayout()
+        layout.addLayout(self.positions_container)
+
+        self.cb_click.stateChanged.connect(self._toggle_click_fields)
+        self.cb_click_interval.stateChanged.connect(self._toggle_click_fields)
+        self.cb_positions.stateChanged.connect(self._toggle_click_fields)
+        self._toggle_click_fields()
+
+        layout.addWidget(self._hline())
+
+        # Movement
         layout.addWidget(QLabel("Mausbewegung:"))
-        self.combo_movement = QComboBox()
-        self.combo_movement.addItems([
+        self.movement_mode = QComboBox()
+        self.movement_mode.addItems([
             "Keine",
             "Kreis",
-            "Dreieck",
             "Quadrat",
+            "8",
             "Horizontale 8",
             "Eigenes Muster"
         ])
-        self.combo_movement.currentTextChanged.connect(self.update_drawing_area)
-        layout.addWidget(self.combo_movement)
+        layout.addWidget(self.movement_mode)
 
-        # Größe der Mausbewegung
-        hsize = QHBoxLayout()
-        hsize.addWidget(QLabel("Bewegungsgröße:"))
+        row_size = QHBoxLayout()
+        row_size.addWidget(QLabel("Bewegungsgröße:"))
+        self.movement_size = QSlider(Qt.Orientation.Horizontal)
+        self.movement_size.setRange(10, 500)
+        self.movement_size.setValue(150)
+        row_size.addWidget(self.movement_size)
+        layout.addLayout(row_size)
 
-        from PyQt6.QtWidgets import QSlider
-        from PyQt6.QtCore import Qt
-
-        self.movement_size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.movement_size_slider.setRange(10, 500)
-        self.movement_size_slider.setValue(150)
-        self.movement_size_slider.setTickInterval(10)
-        self.movement_size_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        hsize.addWidget(self.movement_size_slider)
-
-        layout.addLayout(hsize)
-
-        # Geschwindigkeit der Mausbewegung
-        hspeed = QHBoxLayout()
-        hspeed.addWidget(QLabel("Bewegungsgeschwindigkeit:"))
-
-        from PyQt6.QtWidgets import QSlider
-
-        self.movement_speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.movement_speed_slider.setRange(1, 20)  # 1 = sehr schnell, 50 = sehr langsam
-        self.movement_speed_slider.setValue(10)  # Standard
-        self.movement_speed_slider.setTickInterval(1)
-        self.movement_speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        hspeed.addWidget(self.movement_speed_slider)
-
-        layout.addLayout(hspeed)
-
-        self.cb_save_pattern = QCheckBox("Eigenes Muster mit speichern")
-        layout.addWidget(self.cb_save_pattern)
+        row_speed = QHBoxLayout()
+        row_speed.addWidget(QLabel("Bewegungsgeschwindigkeit:"))
+        self.movement_speed = QSlider(Qt.Orientation.Horizontal)
+        self.movement_speed.setRange(1, 20)  # 1 schnell, 20 langsam
+        self.movement_speed.setValue(10)
+        row_speed.addWidget(self.movement_speed)
+        layout.addLayout(row_speed)
 
         self.draw_container = QVBoxLayout()
         layout.addLayout(self.draw_container)
 
-        # Hotkeys
-        self.cb_hotkeys = QCheckBox("Eigene Hotkeys verwenden")
-        self.cb_hotkeys.stateChanged.connect(self.toggle_hotkeys)
-        layout.addWidget(self.cb_hotkeys)
+        self.movement_mode.currentTextChanged.connect(self._update_draw_area)
+        self._update_draw_area()
 
-        hk1 = QHBoxLayout()
-        hk1.addWidget(QLabel("Start-Hotkey:"))
-        self.start_hotkey_input = QLineEdit()
-        self.start_hotkey_input.setEnabled(False)
-        self.start_hotkey_input.setPlaceholderText("z.B. a, 1, f5, x1, left")
-        hk1.addWidget(self.start_hotkey_input)
-        layout.addLayout(hk1)
+    def _hline(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        return line
 
-        hk2 = QHBoxLayout()
-        hk2.addWidget(QLabel("Stop-Hotkey:"))
-        self.stop_hotkey_input = QLineEdit()
-        self.stop_hotkey_input.setEnabled(False)
-        self.stop_hotkey_input.setPlaceholderText("z.B. b, 2, f6, x2, right")
-        hk2.addWidget(self.stop_hotkey_input)
-        layout.addLayout(hk2)
+    def _toggle_switch_fields(self):
+        enabled = self.cb_switch.isChecked()
+        self.sw_min.setEnabled(enabled)
+        self.sw_sec.setEnabled(enabled)
+        self.sw_target.setEnabled(enabled)
 
-        save_layout = QHBoxLayout()
+    def _toggle_jump_fields(self):
+        enabled = self.cb_jump_back.isChecked()
+        self.jump_back_target.setEnabled(enabled)
 
-        self.btn_save = QPushButton("Profil(e) speichern")
-        self.btn_save.clicked.connect(self.on_save_clicked)
-        save_layout.addWidget(self.btn_save)
+    def _toggle_click_fields(self):
+        click_on = self.cb_click.isChecked()
+        self.cb_click_interval.setEnabled(click_on)
+        self.cb_positions.setEnabled(click_on)
 
-        self.btn_load = QPushButton("Profile laden")
-        self.btn_load.clicked.connect(self.on_load_clicked)
-        save_layout.addWidget(self.btn_load)
+        interval_on = click_on and self.cb_click_interval.isChecked()
+        self.global_click_interval.setEnabled(interval_on)
 
-        layout.addLayout(save_layout)
+        pos_on = click_on and self.cb_positions.isChecked()
+        self.btn_clear_positions.setEnabled(pos_on)
+        self._set_positions_rows_enabled(pos_on)
 
-        self.btn_start = QPushButton("Start (F5 / Hotkey)")
-        self.btn_start.clicked.connect(self.start)
-        layout.addWidget(self.btn_start)
+        self._update_pos_label()
+        self.on_ui_changed()
 
-        self.btn_stop = QPushButton("Stop (F6 / Hotkey)")
-        self.btn_stop.clicked.connect(self.stop)
-        layout.addWidget(self.btn_stop)
+    def _set_positions_rows_enabled(self, enabled: bool):
+        for row in self.position_rows:
+            row.setEnabled(enabled)
 
-        self.start_hotkey_input.textChanged.connect(self.apply_hotkeys)
-        self.stop_hotkey_input.textChanged.connect(self.apply_hotkeys)
-
-        self.setLayout(layout)
-
-    # GUI Toggles…
-    def toggle_set2(self):
-        a = self.cb_set2.isChecked()
-        self.key_input2.setEnabled(a)
-        self.interval2.setEnabled(a)
-        self.inner2.setEnabled(a)
-
-    def toggle_switch(self):
-        a = self.cb_switch.isChecked()
-        self.sw_min.setEnabled(a)
-        self.sw_sec.setEnabled(a)
-        self.cb_immediate.setEnabled(a)
-
-    def toggle_mouse(self):
-        checked = self.cb_mouse.isChecked()
-        self.mouse_interval.setEnabled(checked)
-        self.mouse_enabled = checked
-
-        if checked and self.running and self.current_run_id is not None:
-            if not self.click_thread or not self.click_thread.is_alive():
-                t = Thread(target=self.mouse_click_loop, args=(self.current_run_id,
-                                                               self.mouse_interval.value()), daemon=True)
-                self.click_thread = t
-                t.start()
-
-    def toggle_hotkeys(self):
-        self.custom_hotkeys_enabled = self.cb_hotkeys.isChecked()
-        self.start_hotkey_input.setEnabled(self.custom_hotkeys_enabled)
-        self.stop_hotkey_input.setEnabled(self.custom_hotkeys_enabled)
-        if self.custom_hotkeys_enabled:
-            self.apply_hotkeys()
-
-    def apply_hotkeys(self):
-        self.start_hotkey = self.start_hotkey_input.text().strip().lower()
-        self.stop_hotkey = self.stop_hotkey_input.text().strip().lower()
-
-    def adjust_drawing_window_height(self):
-        main_win = self.main_window
-
-        # Zeichenfeld aktiv?
-        if self.combo_movement.currentText() == "Eigenes Muster":
-            # Empfohlene zusätzliche Höhe
-            extra_height = 150
-        else:
-            extra_height = -150
-
-        # aktuelle Größe des Fensters
-        current_w = main_win.width()
-        current_h = main_win.height()
-
-        # neue Höhe berechnen
-        new_h = max(600, current_h + extra_height)
-
-        main_win.resize(current_w, new_h)
-
-    def update_drawing_area(self):
+    def _update_draw_area(self):
         for i in reversed(range(self.draw_container.count())):
             w = self.draw_container.itemAt(i).widget()
             if w:
                 w.deleteLater()
 
-        if self.combo_movement.currentText() == "Eigenes Muster":
-            self.drawing_widget = DrawingWidget(self)
-            self.draw_container.addWidget(QLabel("Zeichnen Sie Ihr Muster:"))
-            self.draw_container.addWidget(self.drawing_widget)
-        else:
-            self.drawing_widget = None
+        if self.movement_mode.currentText() == "Eigenes Muster":
+            self.draw_container.addWidget(QLabel("Eigenes Muster zeichnen (250×250):"))
+            self.draw_container.addWidget(DrawingWidget(self.custom_path_points))
+        self.on_ui_changed()
 
-        # Fenster dynamisch anpassen
-        self.adjust_drawing_window_height()
+    def get_keys(self) -> List[str]:
+        return [k.strip().lower() for k in self.keys_input.text().split(",") if k.strip()]
 
-    # ---------------- THREAD-FUNKTIONEN ----------------
+    # Positions
+    def clear_positions(self):
+        self.positions.clear()
+        self._rebuild_positions_ui()
+        self._update_pos_label()
+        self.on_ui_changed()
 
-    def press_keys_loop(self, my_run_id, keys, outer_interval, inner_interval):
-        while self.running and my_run_id == self.run_id:
-            for k in keys:
-                if not self.running or my_run_id != self.run_id:
-                    return
-                self.press_single_key(k)
-                time.sleep(inner_interval / 1000)
-            time.sleep(outer_interval / 1000)
-
-    def press_single_key(self, key):
-        special = {
-            "enter": Key.enter, "space": Key.space, "tab": Key.tab,
-            "shift": Key.shift, "ctrl": Key.ctrl, "alt": Key.alt, "esc": Key.esc,
-            "up": Key.up, "down": Key.down, "left": Key.left, "right": Key.right,
-            **{f"f{i}": getattr(Key, f"f{i}") for i in range(1, 13)}
-        }
-        if key in special:
-            kb.press(special[key])
-            kb.release(special[key])
+    def add_position_from_mouse(self, pos_xy: Tuple[int, int]):
+        if len(self.positions) >= 8:
             return
-        if len(key) == 1:
-            kb.press(key)
-            kb.release(key)
+        x, y = int(pos_xy[0]), int(pos_xy[1])
+        self.positions.append(ClickPosition(enabled=True, x=x, y=y, interval_ms=0))
+        self._rebuild_positions_ui()
+        self._update_pos_label()
+        self.on_ui_changed()
 
-    def move_mouse_path(self, my_run_id, points, speed):
-        # Startpunkt EINMAL speichern
-        base_x, base_y = mouse.position
+    def _rebuild_positions_ui(self):
+        while self.positions_container.count() > 0:
+            item = self.positions_container.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
 
-        while self.running and my_run_id == self.run_id:
+        self.position_rows.clear()
+        for p in self.positions:
+            row = ClickPositionRow(p, on_remove=self._remove_position_row)
+            self.position_rows.append(row)
+            self.positions_container.addWidget(row)
 
-            for dx, dy in points:
-                if not self.running or my_run_id != self.run_id:
-                    return
+        self._set_positions_rows_enabled(self.cb_click.isChecked() and self.cb_positions.isChecked())
 
-                # EXAKT relativ zum Startpunkt der Bewegung
-                mouse.position = (base_x + dx, base_y + dy)
-                time.sleep(speed)
+    def _remove_position_row(self, row_widget: ClickPositionRow):
+        try:
+            pos_obj = row_widget.pos
+            self.positions = [p for p in self.positions if p is not pos_obj]
+        except Exception:
+            pass
+        self._rebuild_positions_ui()
+        self._update_pos_label()
+        self.on_ui_changed()
 
-            # WICHTIG: Startpunkt NICHT neu setzen!!
-            # Dadurch bleibt die Form stabil an der ursprünglichen Stelle.
+    def _update_pos_label(self):
+        self.lbl_pos_count.setText(f"Positionen: {len(self.positions)}/8")
 
-    def alternating_loop(self, my_run_id, keys1, outer1, inner1,
-                         keys2, outer2, inner2,
-                         total_seconds, immediate_back):
-        while self.running and my_run_id == self.run_id:
+    # Serialization
+    def to_dict(self) -> dict:
+        return {
+            "keys": self.keys_input.text(),
+            "inner_ms": self.inner_ms.value(),
+            "repeat_ms": self.repeat_ms.value(),
+            "switch": {
+                "enabled": self.cb_switch.isChecked(),
+                "min": self.sw_min.value(),
+                "sec": self.sw_sec.value(),
+                "target": self.sw_target.value(),
+            },
+            "jump_back": {
+                "enabled": self.cb_jump_back.isChecked(),
+                "target": self.jump_back_target.value(),
+            },
+            "click": {
+                "enabled": self.cb_click.isChecked(),
+                "interval_enabled": self.cb_click_interval.isChecked(),
+                "global_interval_ms": self.global_click_interval.value(),
+                "positions_enabled": self.cb_positions.isChecked(),
+                "positions": [p.to_dict() for p in self.positions],
+            },
+            "movement": {
+                "mode": self.movement_mode.currentText(),
+                "size": self.movement_size.value(),
+                "speed": self.movement_speed.value(),
+                "custom_path": self.custom_path_points,
+            }
+        }
 
-            end = time.time() + total_seconds
-            while self.running and my_run_id == self.run_id and time.time() < end:
-                for k in keys1:
-                    if not self.running or my_run_id != self.run_id:
-                        return
-                    self.press_single_key(k)
-                    time.sleep(inner1 / 1000)
-                time.sleep(outer1 / 1000)
+    def from_dict(self, data: dict):
+        self.keys_input.setText(data.get("keys", ""))
+        self.inner_ms.setValue(clamp_int(data.get("inner_ms"), 1, 60000, 50))
+        self.repeat_ms.setValue(clamp_int(data.get("repeat_ms"), 1, 60000, 150))
 
-            if not self.running:
-                return
+        sw = data.get("switch", {})
+        self.cb_switch.setChecked(bool(sw.get("enabled", False)))
+        self.sw_min.setValue(clamp_int(sw.get("min"), 0, 180, 0))
+        self.sw_sec.setValue(clamp_int(sw.get("sec"), 0, 59, 0))
+        self.sw_target.setValue(clamp_int(sw.get("target"), 1, 999, 1))
+        self._toggle_switch_fields()
 
-            if immediate_back:
-                for k in keys2:
-                    if not self.running or my_run_id != self.run_id:
-                        return
-                    self.press_single_key(k)
-                    time.sleep(inner2 / 1000)
+        jb = data.get("jump_back", {})
+        self.cb_jump_back.setChecked(bool(jb.get("enabled", False)))
+        self.jump_back_target.setValue(clamp_int(jb.get("target"), 1, 999, 1))
+        self._toggle_jump_fields()
+
+        ck = data.get("click", {})
+        self.cb_click.setChecked(bool(ck.get("enabled", False)))
+        self.cb_click_interval.setChecked(bool(ck.get("interval_enabled", False)))
+        self.global_click_interval.setValue(clamp_int(ck.get("global_interval_ms"), 10, 60000, 200))
+        self.cb_positions.setChecked(bool(ck.get("positions_enabled", False)))
+
+        self.positions = []
+        pos_list = ck.get("positions", [])
+        if isinstance(pos_list, list):
+            for it in pos_list[:8]:
+                if isinstance(it, dict):
+                    self.positions.append(ClickPosition.from_dict(it))
+        self._rebuild_positions_ui()
+        self._toggle_click_fields()
+
+        mv = data.get("movement", {})
+        mode = mv.get("mode", "Keine")
+        if mode in [self.movement_mode.itemText(i) for i in range(self.movement_mode.count())]:
+            self.movement_mode.setCurrentText(mode)
+        self.movement_size.setValue(clamp_int(mv.get("size"), 10, 500, 150))
+        self.movement_speed.setValue(clamp_int(mv.get("speed"), 1, 20, 10))
+        self.custom_path_points = safe_float_pair_list(mv.get("custom_path", []))
+        self._update_draw_area()
+
+        self.on_ui_changed()
+
+# -------------------------------
+# Profile widget (sets + runner)
+# -------------------------------
+class ProfileWidget(QWidget):
+    def __init__(self, main_window, profile_name: str):
+        super().__init__()
+        self.main_window = main_window
+        self.profile_name = profile_name
+
+        self.running = False
+        self.run_id = 0
+        self.active_set_token = 0
+
+        self.click_thread: Optional[Thread] = None
+        self.move_thread: Optional[Thread] = None
+        self.runner_thread: Optional[Thread] = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.set_tabs = QTabWidget()
+        self.set_tabs.setTabsClosable(True)
+        self.set_tabs.tabCloseRequested.connect(self._on_close_set_tab)
+        layout.addWidget(self.set_tabs)
+
+        self._add_set_tab()  # Set 1
+        self.set_tabs.addTab(QWidget(), "+")
+        self.set_tabs.tabBarClicked.connect(self._on_set_tab_clicked)
+
+        btns = QHBoxLayout()
+        self.btn_start = QPushButton("Start (F5)")
+        self.btn_stop = QPushButton("Stop (F6)")
+        self.btn_start.clicked.connect(self.start)
+        self.btn_stop.clicked.connect(self.stop)
+        btns.addWidget(self.btn_start)
+        btns.addWidget(self.btn_stop)
+        layout.addLayout(btns)
+
+    def _on_close_set_tab(self, index: int):
+        # "+" Tab darf NICHT geschlossen werden
+        if self.set_tabs.tabText(index) == "+":
+            return
+
+        # Mindestens ein Set muss bleiben
+        if self._set_count() <= 1:
+            QMessageBox.warning(
+                self,
+                "Nicht möglich",
+                "Es muss mindestens ein Set vorhanden sein."
+            )
+            return
+
+        # Set entfernen
+        self.set_tabs.removeTab(index)
+        self._renumber_sets()
+        self._on_ui_changed()
+
+    def _on_ui_changed(self):
+        try:
+            self.main_window.resize_controller.nudge()
+        except Exception:
+            pass
+
+    def _plus_index(self):
+        for i in range(self.set_tabs.count()):
+            if self.set_tabs.tabText(i) == "+":
+                return i
+        return None
+
+    def _set_count(self):
+        pi = self._plus_index()
+        return pi if pi is not None else self.set_tabs.count()
+
+    def _on_set_tab_clicked(self, idx: int):
+        if self.set_tabs.tabText(idx) == "+":
+            self._add_set_tab()
+
+    def _add_set_tab(self, data: Optional[dict] = None):
+        insert_at = self._plus_index()
+        if insert_at is None:
+            insert_at = self.set_tabs.count()
+
+        sw = SetWidget(insert_at + 1, on_ui_changed=self._on_ui_changed)
+        if isinstance(data, dict):
+            sw.from_dict(data)
+
+        self.set_tabs.insertTab(insert_at, sw, f"Set {insert_at + 1}")
+        self._renumber_sets()
+        self.set_tabs.setCurrentIndex(insert_at)
+        self._on_ui_changed()
+
+    def _renumber_sets(self):
+        for i in range(self.set_tabs.count()):
+            if self.set_tabs.tabText(i) == "+":
                 continue
+            w = self.set_tabs.widget(i)
+            if isinstance(w, SetWidget):
+                w.set_index = i + 1
+                self.set_tabs.setTabText(i, f"Set {i + 1}")
+        plus_idx = self._plus_index()
+        if plus_idx is not None:
+            self.set_tabs.tabBar().setTabButton(
+                plus_idx,
+                self.set_tabs.tabBar().ButtonPosition.RightSide,
+                None
+            )
 
-            end = time.time() + total_seconds
-            while self.running and time.time() < end:
-                for k in keys2:
-                    if not self.running or my_run_id != self.run_id:
-                        return
-                    self.press_single_key(k)
-                    time.sleep(inner2 / 1000)
-                time.sleep(outer2 / 1000)
+    def current_set_widget(self) -> Optional[SetWidget]:
+        w = self.set_tabs.currentWidget()
+        return w if isinstance(w, SetWidget) else None
 
-    # ---------------- START / STOP ----------------
+    # Save/Load
+    def collect_settings(self) -> dict:
+        sets = []
+        for i in range(self._set_count()):
+            w = self.set_tabs.widget(i)
+            if isinstance(w, SetWidget):
+                sets.append(w.to_dict())
+        return {"sets": sets}
 
+    def apply_settings(self, data: dict):
+        self.set_tabs.clear()
+        sets = data.get("sets", [])
+        if isinstance(sets, list) and sets:
+            for sdata in sets:
+                self._add_set_tab(sdata if isinstance(sdata, dict) else None)
+        else:
+            self._add_set_tab()
+
+        self.set_tabs.addTab(QWidget(), "+")
+        self._renumber_sets()
+        self._on_ui_changed()
+
+    # Start/Stop
     def start(self):
         if self.running:
+            return
+        if self._set_count() <= 0:
+            QMessageBox.warning(self, "Fehler", "Kein Set vorhanden.")
             return
 
         self.running = True
         self.run_id += 1
         my_run_id = self.run_id
-        self.current_run_id = my_run_id
 
-        keys1 = [k.strip().lower() for k in self.key_input1.text().split(",") if k.strip()]
-        if not keys1:
-            QMessageBox.warning(self, "Fehler", "Bitte mindestens eine Taste in Set 1 eintragen!")
-            self.running = False
-            return
-
-        outer1 = self.interval1.value()
-        inner1 = self.inner1.value()
-
-        # Autoklicker
-        if self.cb_mouse.isChecked():
-            self.mouse_enabled = True
-            self.click_thread = Thread(
-                target=self.mouse_click_loop,
-                args=(my_run_id, self.mouse_interval.value()),
-                daemon=True
-            )
-            self.click_thread.start()
-        else:
-            self.mouse_enabled = False
-
-        shape = self.combo_movement.currentText()
-        size = self.movement_size_slider.value()  # <<< Sliderwert holen
-        raw_speed = self.movement_speed_slider.value()
-        speed = (21 - raw_speed) / 1000
-
-        if shape != "Keine":
-            if shape == "Kreis":
-                pts = generate_circle_points(radius=size)
-            elif shape == "Dreieck":
-                pts = generate_triangle_points(size=size)
-            elif shape == "Quadrat":
-                pts = generate_square_points(size=size)
-            elif shape == "Horizontale 8":
-                pts = generate_eight_points(radius=size)
-            elif shape == "Eigenes Muster":
-                if not self.custom_path_points:
-                    QMessageBox.warning(self, "Fehler", "Bitte zuerst ein Muster zeichnen!")
-                    self.running = False
-                    return
-
-                # Eigenes Muster skalieren
-                pts = [(x * (size / 150), y * (size / 150)) for x, y in self.custom_path_points]
-            else:
-                pts = []
-
-            if pts:
-                self.movement_thread = Thread(
-                    target=self.move_mouse_path,
-                    args=(my_run_id, pts, speed),
-                    daemon=True
-                )
-                self.movement_thread.start()
-
-        # Alternation
-        if self.cb_switch.isChecked() and self.cb_set2.isChecked():
-            keys2 = [k.strip().lower() for k in self.key_input2.text().split(",") if k.strip()]
-            if not keys2:
-                QMessageBox.warning(self, "Fehler", "Set 2 ist aktiviert, aber leer!")
-                self.running = False
-                return
-
-            outer2 = self.interval2.value()
-            inner2 = self.inner2.value()
-            total_seconds = self.sw_min.value() * 60 + self.sw_sec.value()
-            immediate = self.cb_immediate.isChecked()
-
-            self.alternate_thread = Thread(
-                target=self.alternating_loop,
-                args=(my_run_id, keys1, outer1, inner1,
-                      keys2, outer2, inner2,
-                      total_seconds, immediate),
-                daemon=True
-            )
-            self.alternate_thread.start()
-            return
-
-        self.key_thread = Thread(
-            target=self.press_keys_loop,
-            args=(my_run_id, keys1, outer1, inner1),
-            daemon=True
-        )
-        self.key_thread.start()
+        self.runner_thread = Thread(target=self._runner_loop, args=(my_run_id,), daemon=True)
+        self.runner_thread.start()
 
     def stop(self):
         self.running = False
-        self.mouse_enabled = False
         self.run_id += 1
-        print(f"[{self.profile_name}] STOP – Threads gekillt")
+        self.active_set_token += 1
 
-    # ---------------- SPEICHERN / LADEN ----------------
+    # Runner
+    def _runner_loop(self, my_run_id: int):
+        current_index = 0  # immer Set 1 starten
 
-    def on_save_clicked(self):
-        self.main_window.save_profiles()
+        while self.running and my_run_id == self.run_id:
+            set_count = self._set_count()
+            if set_count <= 0:
+                return
 
-    def on_load_clicked(self):
-        self.main_window.load_profiles_from_file()
+            if current_index < 0 or current_index >= set_count:
+                current_index = 0
 
-    def collect_settings(self):
-        return {
-            "set1": {
-                "keys": self.key_input1.text(),
-                "outer": self.interval1.value(),
-                "inner": self.inner1.value()
-            },
-            "set2": {
-                "enabled": self.cb_set2.isChecked(),
-                "keys": self.key_input2.text(),
-                "outer": self.interval2.value(),
-                "inner": self.inner2.value()
-            },
-            "switch": {
-                "enabled": self.cb_switch.isChecked(),
-                "minutes": self.sw_min.value(),
-                "seconds": self.sw_sec.value(),
-                "immediate": self.cb_immediate.isChecked()
-            },
-            "mouse": {
-                "enabled": self.cb_mouse.isChecked(),
-                "interval": self.mouse_interval.value(),
-                "movement": self.combo_movement.currentText()
-            },
-            "hotkeys": {
-                "custom_enabled": self.cb_hotkeys.isChecked(),
-                "start": self.start_hotkey_input.text(),
-                "stop": self.stop_hotkey_input.text()
-            },
-            "pattern": {
-                "save_pattern": self.cb_save_pattern.isChecked(),
-                "points": self.custom_path_points if self.cb_save_pattern.isChecked() else None,
-                "movement_size": self.movement_size_slider.value()
-            }
-        }
+            sw = self.set_tabs.widget(current_index)
+            if not isinstance(sw, SetWidget):
+                current_index = 0
+                continue
 
-    def apply_settings(self, data: dict):
-        # Set 1
-        set1 = data.get("set1", {})
-        self.key_input1.setText(set1.get("keys", ""))
-        self.interval1.setValue(set1.get("outer", 150))
-        self.inner1.setValue(set1.get("inner", 50))
+            # activate set token
+            self.active_set_token += 1
+            my_set_token = self.active_set_token
 
-        # Set 2
-        set2 = data.get("set2", {})
-        self.cb_set2.setChecked(set2.get("enabled", False))
-        self.toggle_set2()
-        self.key_input2.setText(set2.get("keys", ""))
-        self.interval2.setValue(set2.get("outer", 300))
-        self.inner2.setValue(set2.get("inner", 50))
+            # start per-set threads
+            self._start_set_threads(my_run_id, my_set_token, sw)
 
-        # Switch
-        sw = data.get("switch", {})
-        self.cb_switch.setChecked(sw.get("enabled", False))
-        self.toggle_switch()
-        self.sw_min.setValue(sw.get("minutes", 0))
-        self.sw_sec.setValue(sw.get("seconds", 0))
-        self.cb_immediate.setChecked(sw.get("immediate", False))
+            set_start_time = time.time()
 
-        # Mouse
-        mouse_conf = data.get("mouse", {})
-        self.cb_mouse.setChecked(mouse_conf.get("enabled", False))
-        self.toggle_mouse()
-        self.mouse_interval.setValue(mouse_conf.get("interval", 200))
-        pattern = data.get("pattern", {})
-        self.movement_size_slider.setValue(pattern.get("movement_size", 150))
+            # cycle loop (zyklisch)
+            while self.running and my_run_id == self.run_id and my_set_token == self.active_set_token:
+                # press keys in order
+                for k in sw.get_keys():
+                    if not (self.running and my_run_id == self.run_id and my_set_token == self.active_set_token):
+                        break
+                    press_key_text(k)
+                    time.sleep(sw.inner_ms.value() / 1000.0)
 
-        movement = mouse_conf.get("movement", "Keine")
-        if movement in [self.combo_movement.itemText(i) for i in range(self.combo_movement.count())]:
-            self.combo_movement.setCurrentText(movement)
-        else:
-            self.combo_movement.setCurrentText("Keine")
-        self.update_drawing_area()
+                # click-per-cycle if click enabled but interval NOT enabled
+                if sw.cb_click.isChecked() and not sw.cb_click_interval.isChecked():
+                    self._single_click_cycle(sw)
 
-        # Hotkeys
-        hk = data.get("hotkeys", {})
-        self.cb_hotkeys.setChecked(hk.get("custom_enabled", False))
-        self.toggle_hotkeys()
-        self.start_hotkey_input.setText(hk.get("start", ""))
-        self.stop_hotkey_input.setText(hk.get("stop", ""))
+                # repeat
+                time.sleep(sw.repeat_ms.value() / 1000.0)
 
-        # Pattern
-        patt = data.get("pattern", {})
-        save_pattern = patt.get("save_pattern", False)
-        self.cb_save_pattern.setChecked(save_pattern)
-        pts = patt.get("points")
-        if save_pattern and isinstance(pts, list):
-            try:
-                self.custom_path_points = [(float(x), float(y)) for x, y in pts]
-            except Exception:
-                self.custom_path_points = []
+                # switch after time
+                if sw.cb_switch.isChecked():
+                    dur = sw.sw_min.value() * 60 + sw.sw_sec.value()
+                    if dur > 0 and (time.time() - set_start_time) >= dur:
+                        current_index = max(1, sw.sw_target.value()) - 1
+                        self.active_set_token += 1
+                        break
+                    continue
 
+                # no timed switch -> next set OR jump back
+                if sw.cb_jump_back.isChecked():
+                    current_index = max(1, sw.jump_back_target.value()) - 1
+                else:
+                    current_index += 1
+                    if current_index >= set_count:
+                        current_index = 0
 
-# ---------------------------------------------------------
-#                     MAIN WINDOW MIT TABS
-# ---------------------------------------------------------
+                self.active_set_token += 1
+                break
 
+    def _single_click_cycle(self, sw: SetWidget):
+        try:
+            if sw.cb_positions.isChecked() and sw.positions:
+                active = [p for p in sw.positions if p.enabled]
+                if active:
+                    for p in active:
+                        ms.position = (p.x, p.y)
+                        ms.click(Button.left)
+                else:
+                    ms.click(Button.left)
+            else:
+                ms.click(Button.left)
+        except Exception:
+            pass
+
+    def _start_set_threads(self, my_run_id: int, my_set_token: int, sw: SetWidget):
+        # CLICK INTERVAL THREAD
+        if sw.cb_click.isChecked() and sw.cb_click_interval.isChecked():
+            def click_loop():
+                while (self.running and my_run_id == self.run_id and my_set_token == self.active_set_token and
+                       sw.cb_click.isChecked() and sw.cb_click_interval.isChecked()):
+                    try:
+                        global_iv = sw.global_click_interval.value()
+
+                        if sw.cb_positions.isChecked() and sw.positions:
+                            active_positions = [p for p in sw.positions if p.enabled]
+                            if not active_positions:
+                                ms.click(Button.left)
+                                time.sleep(global_iv / 1000.0)
+                                continue
+
+                            for p in active_positions:
+                                if not (self.running and my_run_id == self.run_id and my_set_token == self.active_set_token):
+                                    return
+                                ms.position = (p.x, p.y)
+                                ms.click(Button.left)
+                                iv = p.interval_ms if p.interval_ms > 0 else global_iv
+                                time.sleep(iv / 1000.0)
+                        else:
+                            ms.click(Button.left)
+                            time.sleep(global_iv / 1000.0)
+                    except Exception:
+                        time.sleep(0.05)
+
+            self.click_thread = Thread(target=click_loop, daemon=True)
+            self.click_thread.start()
+
+        # MOVEMENT THREAD
+        mode = sw.movement_mode.currentText()
+        if mode != "Keine":
+            size = sw.movement_size.value()
+            raw_speed = sw.movement_speed.value()
+            speed = (21 - raw_speed) / 1000.0
+
+            pts = None
+            if mode == "Kreis":
+                pts = generate_circle_points(radius=size)
+            elif mode == "Quadrat":
+                pts = generate_square_points(size=size)
+            elif mode == "8":
+                pts = generate_eight_points(radius=size)
+            elif mode == "Horizontale 8":
+                pts = generate_horizontal_eight_points(radius=size)
+            elif mode == "Eigenes Muster":
+                if sw.custom_path_points:
+                    pts = [(x * (size / 150), y * (size / 150)) for x, y in sw.custom_path_points]
+
+            if pts:
+                base_x, base_y = ms.position
+
+                def move_loop():
+                    while self.running and my_run_id == self.run_id and my_set_token == self.active_set_token:
+                        for dx, dy in pts:
+                            if not (self.running and my_run_id == self.run_id and my_set_token == self.active_set_token):
+                                return
+                            try:
+                                ms.position = (base_x + dx, base_y + dy)
+                            except Exception:
+                                return
+                            time.sleep(speed)
+
+                self.move_thread = Thread(target=move_loop, daemon=True)
+                self.move_thread.start()
+
+# -------------------------------
+# Main window
+# -------------------------------
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setWindowTitle("Button Masher Pro 6.1 – Multi-Profil")
-        self.setMinimumWidth(600)
+        self.setWindowTitle("Button Masher Pro — Funktionsfähig (Wayland/Fedora)")
+        self.setMinimumWidth(720)
 
+        self.resize_controller = WindowResizeController(self, base_size=QSize(1020, 560))
+        self.resize(self.resize_controller.base_size)
+
+        main_layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
-
-        main_layout = QVBoxLayout()
         main_layout.addWidget(self.tabs)
 
-        control_layout = QHBoxLayout()
-        self.btn_add_profile = QPushButton("Neues Profil")
-        self.btn_add_profile.clicked.connect(self.add_profile)
-        control_layout.addWidget(self.btn_add_profile)
+        controls = QHBoxLayout()
 
-        self.btn_rename_profile = QPushButton("Profil umbenennen")
-        self.btn_rename_profile.clicked.connect(self.rename_current_profile)
-        control_layout.addWidget(self.btn_rename_profile)
+        self.btn_add = QPushButton("Neues Profil")
+        self.btn_add.clicked.connect(self.add_profile_dialog)
+        controls.addWidget(self.btn_add)
 
-        self.btn_delete_profile = QPushButton("Profil löschen")
-        self.btn_delete_profile.clicked.connect(self.delete_current_profile)
-        control_layout.addWidget(self.btn_delete_profile)
+        self.btn_rename = QPushButton("Profil umbenennen")
+        self.btn_rename.clicked.connect(self.rename_current_profile)
+        controls.addWidget(self.btn_rename)
 
-        main_layout.addLayout(control_layout)
-        self.setLayout(main_layout)
+        self.btn_delete = QPushButton("Profil löschen")
+        self.btn_delete.clicked.connect(self.delete_current_profile)
+        controls.addWidget(self.btn_delete)
 
-        # Profile laden oder Standard-Profil anlegen
-        self.load_profiles()
+        self.btn_save = QPushButton("Speichern")
+        self.btn_save.clicked.connect(self.save_profiles_default)
+        controls.addWidget(self.btn_save)
 
-        self.listener = keyboard.Listener(on_press=self.on_hotkey)
-        self.listener.start()
+        self.btn_save_as = QPushButton("Speichern unter…")
+        self.btn_save_as.clicked.connect(self.save_profiles_as)
+        controls.addWidget(self.btn_save_as)
 
-        # globaler Mouse Hotkey Listener
-        from pynput import mouse
-        self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click)
-        self.mouse_listener.start()
+        self.btn_load = QPushButton("Laden…")
+        self.btn_load.clicked.connect(self.load_profiles_from_file)
+        controls.addWidget(self.btn_load)
 
-    def on_mouse_click(self, x, y, button, pressed):
-        if not pressed:
-            return
+        main_layout.addLayout(controls)
 
-        widget = self.tabs.currentWidget()
-        if not isinstance(widget, ProfileWidget):
-            return
+        self.load_profiles_default()
 
-        raw = str(button).lower()
+        # Qt Shortcuts (immer zuverlässig, wenn Fokus)
+        QShortcut(QKeySequence("F5"), self, activated=self._qt_start)
+        QShortcut(QKeySequence("F6"), self, activated=self._qt_stop)
+        QShortcut(QKeySequence("F7"), self, activated=self._qt_add_pos)
 
-        # Doppelte Präfixe entfernen: "button.button8" → "button8"
-        if raw.startswith("button.button"):
-            raw = raw.replace("button.button", "button")
-
-        # Logitech M650 + Linux Mapping
-        map_btn = {
-            "button8": "x1",
-            "button9": "x2",
-            "button.xbutton1": "x1",
-            "button.xbutton2": "x2",
-            "button.left": "left",
-            "button.right": "right",
-            "button.middle": "middle"
-        }
-
-        name = map_btn.get(raw, raw.replace("button.", ""))
-
-        print("Maus-Hotkey gedrückt:", name)
-
-        if widget.custom_hotkeys_enabled:
-
-            if widget.start_hotkey == name:
-                print(" → Start-Hotkey erkannt!")
-                widget.start()
-                return
-
-            if widget.stop_hotkey == name:
-                print(" → Stop-Hotkey erkannt!")
-                widget.stop()
-                return
-
-    # ---------------------------------------------------------
-    # PROFIL LADEN BEIM START ODER RELOAD
-    # ---------------------------------------------------------
-    def load_profiles(self, force_reload=False):
-
-        # Falls Reload: Tabs komplett entfernen
-        if force_reload:
-            while self.tabs.count() > 0:
-                self.tabs.removeTab(0)
-
-        # Datei prüfen
-        if not SETTINGS_PATH.exists():
-            if self.tabs.count() == 0:
-                self.add_profile("Profil 1")
-            return
-
-        # Datei laden
+        # Global hotkeys attempt (pynput)
         try:
-            raw = SETTINGS_PATH.read_text(encoding="utf-8")
-            cfg = json.loads(raw)
-        except Exception as e:
-            QMessageBox.critical(self, "Ladefehler",
-                                 f"Profile konnten nicht geladen werden:\n{e}")
-            if self.tabs.count() == 0:
-                self.add_profile("Profil 1")
+            self.listener = pynput_keyboard.Listener(on_press=self.on_hotkey)
+            self.listener.start()
+        except Exception:
+            self.listener = None
+
+    def current_profile(self) -> Optional[ProfileWidget]:
+        w = self.tabs.currentWidget()
+        return w if isinstance(w, ProfileWidget) else None
+
+    # Qt shortcut handlers
+    def _qt_start(self):
+        pw = self.current_profile()
+        if pw:
+            pw.start()
+
+    def _qt_stop(self):
+        pw = self.current_profile()
+        if pw:
+            pw.stop()
+
+    def _qt_add_pos(self):
+        pw = self.current_profile()
+        if not pw:
             return
-
-        profiles = cfg.get("profiles", [])
-
-        if not profiles:
-            if self.tabs.count() == 0:
-                self.add_profile("Profil 1")
+        sw = pw.current_set_widget()
+        if not sw:
             return
+        if not (sw.cb_click.isChecked() and sw.cb_positions.isChecked()):
+            return
+        sw.add_position_from_mouse(ms.position)
+        self.resize_controller.nudge()
 
-        # Profile neu erzeugen
-        for p in profiles:
-            name = p.get("name", "Profil")
-            data = p.get("data", {})
-            self.add_profile(name=name, data=data)
-
-    # ---------------------------------------------------------
-    # MANUELLES LADEN EINER JSON-DATEI
-    # ---------------------------------------------------------
-    def load_profiles_from_file(self):
-        from PyQt6.QtWidgets import QFileDialog
-
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Profil-Datei laden",
-            str(Path.home()),
-            "JSON-Dateien (*.json)"
-        )
-
-        if not path:
-            return  # Abbrechen
-
-        # Datei einlesen
+    # Global hotkey handler (pynput)
+    def on_hotkey(self, key):
         try:
-            raw = Path(path).read_text(encoding="utf-8")
-            cfg = json.loads(raw)
-        except Exception as e:
-            QMessageBox.critical(self, "Fehler beim Laden",
-                                 f"Die Datei konnte nicht geladen werden:\n{e}")
-            return
+            pw = self.current_profile()
+            if not pw:
+                return
+            if key == Key.f5:
+                pw.start()
+            elif key == Key.f6:
+                pw.stop()
+            elif key == Key.f7:
+                sw = pw.current_set_widget()
+                if sw and (sw.cb_click.isChecked() and sw.cb_positions.isChecked()):
+                    sw.add_position_from_mouse(ms.position)
+                    self.resize_controller.nudge()
+        except Exception:
+            pass
 
-        profiles = cfg.get("profiles", [])
-
-        if not profiles:
-            QMessageBox.warning(self, "Keine Profile",
-                                "Die Datei enthält keine Profile.")
-            return
-
-        # alle Tabs löschen
-        while self.tabs.count() > 0:
-            self.tabs.removeTab(0)
-
-        # importierte Profile laden
-        for p in profiles:
-            name = p.get("name", "Profil")
-            data = p.get("data", {})
-            self.add_profile(name=name, data=data)
-
-        QMessageBox.information(self, "Profile geladen",
-                                "Profile wurden erfolgreich geladen.")
-
-    # ---------------------------------------------------------
-    # PROFILVERWALTUNG
-    # ---------------------------------------------------------
-    def add_profile(self, name=None, data=None):
-        if isinstance(name, dict) and data is None:
-            data = name
-            name = None
-
-        if not isinstance(name, str) or not name.strip():
-            name = f"Profil {self.tabs.count() + 1}"
-
-        pw = ProfileWidget(self, initial_name=name)
+    # Profiles
+    def add_profile(self, name: str, data: Optional[dict] = None):
+        pw = ProfileWidget(self, name)
         if isinstance(data, dict):
             pw.apply_settings(data)
-
         idx = self.tabs.addTab(pw, name)
         self.tabs.setCurrentIndex(idx)
+        self.resize_controller.nudge()
+
+    def add_profile_dialog(self):
+        name, ok = QInputDialog.getText(self, "Neues Profil", "Name:")
+        if not ok:
+            return
+        n = (name or "").strip()
+        if not n:
+            n = f"Profil {self.tabs.count() + 1}"
+        self.add_profile(n)
 
     def rename_current_profile(self):
         idx = self.tabs.currentIndex()
         if idx < 0:
             return
-        old_name = self.tabs.tabText(idx)
-        text, ok = QInputDialog.getText(self, "Profil umbenennen", "Neuer Name:", text=old_name)
+        old = self.tabs.tabText(idx)
+        text, ok = QInputDialog.getText(self, "Profil umbenennen", "Neuer Name:", text=old)
         if ok and text.strip():
             new_name = text.strip()
             self.tabs.setTabText(idx, new_name)
-            widget = self.tabs.widget(idx)
-            if isinstance(widget, ProfileWidget):
-                widget.profile_name = new_name
+            w = self.tabs.widget(idx)
+            if isinstance(w, ProfileWidget):
+                w.profile_name = new_name
 
     def delete_current_profile(self):
         idx = self.tabs.currentIndex()
         if idx < 0:
             return
-
         if self.tabs.count() == 1:
-            QMessageBox.warning(self, "Löschen nicht möglich",
-                                "Es muss mindestens ein Profil bestehen bleiben.")
+            QMessageBox.warning(self, "Löschen nicht möglich", "Es muss mindestens ein Profil bestehen bleiben.")
             return
-
         name = self.tabs.tabText(idx)
         reply = QMessageBox.question(
             self,
@@ -924,61 +1018,96 @@ class MainWindow(QWidget):
             f"Soll das Profil „{name}“ wirklich gelöscht werden?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
         if reply == QMessageBox.StandardButton.Yes:
             self.tabs.removeTab(idx)
+            self.resize_controller.nudge()
 
-    def save_profiles(self):
+    # Save/Load
+    def collect_all_profiles(self) -> dict:
         profiles = []
         for i in range(self.tabs.count()):
-            widget = self.tabs.widget(i)
-            if isinstance(widget, ProfileWidget):
-                name = self.tabs.tabText(i)
-                data = widget.collect_settings()
-                profiles.append({"name": name, "data": data})
+            w = self.tabs.widget(i)
+            if isinstance(w, ProfileWidget):
+                profiles.append({
+                    "name": self.tabs.tabText(i),
+                    "data": w.collect_settings()
+                })
+        return {"profiles": profiles}
 
+    def apply_all_profiles(self, cfg: dict):
+        self.tabs.clear()
+        profiles = cfg.get("profiles", []) if isinstance(cfg, dict) else []
+        if not profiles:
+            self.add_profile("Profil 1")
+            return
+        for p in profiles:
+            name = p.get("name", "Profil")
+            data = p.get("data", {})
+            self.add_profile(name, data if isinstance(data, dict) else None)
+
+    def save_profiles_default(self):
         try:
-            SETTINGS_PATH.write_text(json.dumps({"profiles": profiles}, indent=2),
-                                     encoding="utf-8")
+            SETTINGS_PATH.write_text(json.dumps(self.collect_all_profiles(), indent=2), encoding="utf-8")
         except Exception as e:
-            QMessageBox.critical(self, "Speicherfehler",
-                                 f"Profile konnten nicht gespeichert werden:\n{e}")
+            QMessageBox.critical(self, "Speicherfehler", f"Profile konnten nicht gespeichert werden:\n{e}")
 
-    # ---------------------------------------------------------
-    # HOTKEYS
-    # ---------------------------------------------------------
-    def on_hotkey(self, key):
-        widget = self.tabs.currentWidget()
-        if not isinstance(widget, ProfileWidget):
+    def save_profiles_as(self):
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Profile speichern unter…",
+            str(Path.home() / "button_masher_profiles.json"),
+            "JSON-Dateien (*.json)"
+        )
+        if not path_str:
+            return
+        try:
+            Path(path_str).write_text(json.dumps(self.collect_all_profiles(), indent=2), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(self, "Speicherfehler", f"Profile konnten nicht gespeichert werden:\n{e}")
+
+    def load_profiles_default(self):
+        if not SETTINGS_PATH.exists():
+            self.add_profile("Profil 1")
+            return
+        try:
+            cfg = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            QMessageBox.critical(self, "Ladefehler", f"Profile konnten nicht geladen werden:\n{e}")
+            self.add_profile("Profil 1")
+            return
+        self.apply_all_profiles(cfg if isinstance(cfg, dict) else {})
+        self.resize_controller.nudge()
+
+    def load_profiles_from_file(self):
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Profil-Datei laden",
+            str(Path.home()),
+            "JSON-Dateien (*.json)"
+        )
+        if not path_str:
+            return
+        try:
+            cfg = json.loads(Path(path_str).read_text(encoding="utf-8"))
+        except Exception as e:
+            QMessageBox.critical(self, "Ladefehler", f"Die Datei konnte nicht geladen werden:\n{e}")
             return
 
-        try:
-            if widget.custom_hotkeys_enabled:
-                if widget.start_hotkey:
-                    if isinstance(key, Key) and hasattr(Key, widget.start_hotkey):
-                        if key == getattr(Key, widget.start_hotkey):
-                            widget.start()
-                            return
+        profiles = cfg.get("profiles", []) if isinstance(cfg, dict) else []
+        if not profiles:
+            QMessageBox.warning(self, "Keine Profile", "Die Datei enthält keine Profile.")
+            return
 
-                if widget.stop_hotkey:
-                    if isinstance(key, Key) and hasattr(Key, widget.stop_hotkey):
-                        if key == getattr(Key, widget.stop_hotkey):
-                            widget.stop()
-                            return
+        self.apply_all_profiles(cfg)
+        self.resize_controller.nudge()
 
-            if key == Key.f5:
-                widget.start()
-            elif key == Key.f6:
-                widget.stop()
+    def closeEvent(self, event):
+        self.save_profiles_default()
+        super().closeEvent(event)
 
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------
-#                        MAIN
-# ---------------------------------------------------------
-
+# -------------------------------
+# Main
+# -------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
