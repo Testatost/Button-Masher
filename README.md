@@ -1,73 +1,121 @@
-# Button Masher
- ein einfacher Button Masher
+# Button Masher Pro
 
- 🚀 Funktionen
-✔ Multi-Profil-System
+Button Masher Pro ist ein plattformübergreifendes Desktop-Tool (Windows / Linux / macOS) zum automatisierten Drücken von Tastensequenzen und Mausklicks mit Profilen, Sets und globalen Hotkeys.
 
-Beliebig viele Profile als Tabs speichern
+Entwickelt mit Python, PyQt6 und pynput.
 
-Profile benennen, löschen, exportieren, importieren
+---
 
-Einstellungsdatei: button_masher_profiles.json
+## Features
 
-✔ Tasten-Automation
+- Automatisches Tastendrücken (Sequenzen, Intervalle)
+- Automatisierte Mausklicks (global oder positionsbasiert)
+- Profile & Sets mit JSON-Speicherung
+- Mehrsprachig (DE, EN, TR, AR, RU) - (DE → Deutsch, EN → English, TR → Türkçe, AR → العربية, RU → Русский)
+- Hell- / Dunkel-Theme
+- Globale Hotkeys (Start / Stop / Position speichern)
+- Wayland-kompatibel über XWayland
 
-Set 1 & Set 2 (optional)
+---
 
-Zeitabstände pro Set (outer/inner)
+## Voraussetzungen
 
-Automatischer Wechsel zwischen Sets mit Timer
+- Python >= 3.10
+- Virtuelle Umgebung empfohlen
 
-Option: Nach Set 2 sofort zurückspringen
+---
 
-✔ Maus-Automation
+## Python-Abhängigkeiten
 
-Autoklicker (Linksklick)
+```bash
+pip install PyQt6 pynput
+```
 
-Mausbewegungen:
+---
 
-Kreis
+## Betriebssystem-Abhängigkeiten (Linux)
 
-Dreieck
+Unter Linux werden globale Tastatur- und Maus-Events nur über X11 unterstützt.  
+Unter Wayland wird automatisch XWayland (xcb) verwendet.
 
-Quadrat
+### Ubuntu / Debian
 
-Horizontale Acht (∞)
+```bash
+sudo apt install python3-dev python3-xlib xclip xdotool
+```
 
-Eigenes Muster (frei zeichnen)
+### Fedora
 
-Größe und Geschwindigkeit einstellbar
+```bash
+sudo dnf install python3-devel python3-xlib xdotool
+```
 
-Muster bleibt exakt am Startpunkt (kein Wandern!)
+### Arch Linux
 
-✔ Hotkeys
+```bash
+sudo pacman -S python-xlib xdotool
+```
 
-Globale Start-/Stop-Hotkeys
+⚠️ PyCharm **nicht als Flatpak** starten, da sonst `pynput` keine globalen Events empfangen kann.
 
-Unterstützt:
+---
 
-Tastatur-Tasten (a, b, 1, f1–f12, enter, usw.)
+## Starten (Development)
 
-Maus:
+```bash
+python main.py
+```
 
-left / right / middle
+---
 
-x1 / x2 (z. B. Logitech M650: button8/button9)
+## Build (PyInstaller)
 
-Sofortige Aktualisierung beim Eintippen
+### PyInstaller installieren
 
-Start & Stop getrennt konfigurierbar
+```bash
+pip install pyinstaller
+```
 
-✔ Zeichenfeld
+### Windows (mit Icon)
 
-Eigene Mauspfade zeichnen
+```bash
+pyinstaller --onefile --windowed --name ButtonMasherPro --icon icon.ico main.py
+```
 
-Muster wird normalisiert und gespeichert (optional)
+### Linux (mit Icon + pynput-Fix)
 
-🧰 Beispiel für Hotkeys (M650 Logitech)
-Taste	Hotkey-Eingabe
-Daumentaste zurück	x1
-Daumentaste vor	x2
-Linksklick	left
-Rechtsklick	right
-Mittelklick	middle
+```bash
+pyinstaller --onefile --windowed --name ButtonMasherPro --icon icon.png --hidden-import pynput.keyboard._xorg --hidden-import pynput.mouse._xorg main.py
+```
+
+### macOS (mit Icon)
+
+```bash
+pyinstaller --onefile --windowed --name ButtonMasherPro --icon icon.icns main.py
+```
+
+Nach dem Build befindet sich die ausführbare Datei im Ordner:
+
+```text
+dist/
+```
+
+---
+
+## Konfiguration
+
+Profile und UI-Status werden automatisch gespeichert in:
+
+```text
+button_masher_profiles.json
+```
+
+(im selben Verzeichnis wie das Programm)
+
+---
+
+## Hinweise
+
+- Globale Eingaben unter Linux nur über X11 / XWayland möglich
+- Keine Administrator- oder Root-Rechte erforderlich
+- Nutzung auf eigene Verantwortung (z. B. in Spielen)
